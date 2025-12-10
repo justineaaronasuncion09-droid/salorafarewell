@@ -3197,10 +3197,11 @@
                     }
                     return alert('Error moving booking: ' + msg);
                   }
-                  try { const bookings = _loadBookings(); bookings[cat] = res.dates || []; _saveBookings(bookings); } catch(e){}
+                  // Success: realtime listener will update localStorage and calendar
                   _moveState = null;
                   alert('Booking moved to: ' + newDates.join(', '));
-                  renderBookingCalendar();
+                  // Small delay to let listener catch up, then force refresh to be sure
+                  setTimeout(()=>{ try { renderBookingCalendar(); } catch(e){} }, 100);
                 }).catch(err=>{ console.error('Firestore move error', err); alert('Unable to move booking via Firestore.'); });
                 return;
               }
@@ -3584,9 +3585,11 @@
             }
             return alert('Unable to remove booking: '+msg);
           }
-          try { const bookings = _loadBookings(); bookings[cat] = res.dates || []; _saveBookings(bookings); }catch(e){}
+          // Success: the realtime listener will automatically update localStorage and calendar
+          // Just show the success message; the listener will refresh the UI
           alert('Deleted booking '+dateStr);
-          renderBookingCalendar();
+          // Small delay to let the listener catch up, then force refresh to be sure
+          setTimeout(()=>{ try { renderBookingCalendar(); } catch(e){} }, 100);
         }).catch(err=>{ console.error('Firestore delete error', err); alert('Error deleting booking.'); });
         return;
       }
