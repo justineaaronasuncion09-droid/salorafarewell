@@ -2988,22 +2988,33 @@
 
     // Remove specific dates from a category document in Firestore (only if current user booked them)
     function removeDatesFromFirestore(category, datesToRemove){
+      console.log('removeDatesFromFirestore called', { category, datesToRemove, useFirestore: window._useFirestore });
       if (!window._useFirestore || !window._firestore) return Promise.reject(new Error('Firestore not configured'));
       const userId = ensureUserId();
       const ref = window._firestore.collection('bookings').doc(category);
+      console.log('Starting Firestore transaction, userId:', userId);
       return window._firestore.runTransaction(tx => {
         return tx.get(ref).then(doc => {
+          console.log('Got Firestore doc:', { exists: doc.exists, data: doc.data() });
           const currentBookings = (doc.exists && doc.data().bookings) ? doc.data().bookings : {};
+          console.log('Current bookings:', currentBookings);
           // Check ownership: only allow removal if current user booked the date
           const unowned = datesToRemove.find(d => currentBookings[d] && currentBookings[d].userId !== userId);
           if (unowned) throw new Error('not-owner:' + unowned);
           // Remove the dates
           const updated = { ...currentBookings };
           datesToRemove.forEach(d => delete updated[d]);
+          console.log('Updated bookings after removal:', updated);
           tx.set(ref, { bookings: updated }, { merge: true });
           return Object.keys(updated).sort();
         });
-      }).then(dateList => ({ok:true, dates: dateList})).catch(err => ({ok:false, err: err && err.message ? err.message : String(err)}));
+      }).then(dateList => {
+        console.log('Transaction succeeded, remaining dates:', dateList);
+        return {ok:true, dates: dateList};
+      }).catch(err => {
+        console.error('Transaction error:', err);
+        return {ok:false, err: err && err.message ? err.message : String(err)};
+      });
     }
 
     // Move (remove originals and add newDates) in a single Firestore transaction (only if current user owns originals)
@@ -3575,9 +3586,14 @@
 
     function deleteBookedDate(dateStr){
       const cat = _bookingState.category;
+      console.log('Attempting to delete date:', dateStr, 'from category:', cat);
       // If Firestore configured, remove there first
       if (window._useFirestore && window._firestoreReady) {
-        window._firestoreReady.then(()=> removeDatesFromFirestore(cat, [dateStr])).then(res=>{
+        window._firestoreReady.then(()=> {
+          console.log('Firestore ready, calling removeDatesFromFirestore');
+          return removeDatesFromFirestore(cat, [dateStr]);
+        }).then(res=>{
+          console.log('removeDatesFromFirestore response:', res);
           if (!res || !res.ok){
             const msg = res && res.err ? res.err : 'unknown error';
             if (typeof msg === 'string' && msg.indexOf('not-owner:')===0) {
@@ -3589,11 +3605,12 @@
           // Just show the success message; the listener will refresh the UI
           alert('Deleted booking '+dateStr);
           // Small delay to let the listener catch up, then force refresh to be sure
-          setTimeout(()=>{ try { renderBookingCalendar(); } catch(e){} }, 100);
-        }).catch(err=>{ console.error('Firestore delete error', err); alert('Error deleting booking.'); });
+          setTimeout(()=>{ try { renderBookingCalendar(); } catch(e){}  }, 100);
+        }).catch(err=>{ console.error('Firestore delete error', err); alert('Error deleting booking: ' + err.message); });
         return;
       }
       // Fallback: localStorage
+      console.log('Firestore not available, using localStorage fallback');
       const bookings = _loadBookings();
       bookings[cat] = (bookings[cat] || []).filter(d=>d!==dateStr);
       _saveBookings(bookings);
