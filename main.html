@@ -2890,6 +2890,24 @@
 
     window._useFirestore = false; // flip to true by calling setupFirestore(config)
     window._firestoreReady = null;
+    window._userId = null; // Unique user/session ID to track who booked what
+
+    function ensureUserId(){
+      if (!window._userId) {
+        // Create a unique ID for this browser session (persists across page reloads)
+        const stored = localStorage.getItem('_userId');
+        if (stored) {
+          window._userId = stored;
+        } else {
+          window._userId = 'user_' + Date.now() + '_' + Math.random().toString(36).substr(2,9);
+          localStorage.setItem('_userId', window._userId);
+        }
+      }
+      return window._userId;
+    }
+
+    // Call this on startup to ensure userId is ready
+    ensureUserId();
 
     function setupFirestore(cfg){
       if (!cfg || !cfg.projectId) return console.warn('Firestore config missing. Call setupFirestore(config) with your Firebase config.');
@@ -2926,7 +2944,16 @@
           const obj = {};
           snapshot.forEach(doc => {
             const data = doc.data() || {};
-            obj[doc.id] = Array.isArray(data.dates) ? data.dates.slice().sort() : [];
+            // New model: data.bookings is { dateStr: { userId, timestamp }, ... }
+            // Convert to flat array of dates for backward compatibility with calendar renderer
+            if (data.bookings && typeof data.bookings === 'object') {
+              obj[doc.id] = Object.keys(data.bookings).sort();
+            } else if (Array.isArray(data.dates)) {
+              // Old model fallback
+              obj[doc.id] = data.dates.slice().sort();
+            } else {
+              obj[doc.id] = [];
+            }
           });
           try { localStorage.setItem('room_bookings', JSON.stringify(obj)); } catch(e){}
           try { renderBookingCalendar(); } catch(e){}
@@ -2936,53 +2963,73 @@
 
     function finalizePendingBookingFirestore(pending){
       // pending: { category, dates: [...] }
+      // New model stores bookings as { dateStr: { userId, timestamp }, ... }
       if (!window._useFirestore || !window._firestore) return Promise.reject(new Error('Firestore not configured'));
+      const userId = ensureUserId();
       const cat = pending.category;
       const dates = (pending.dates||[]).slice();
       const ref = window._firestore.collection('bookings').doc(cat);
       return window._firestore.runTransaction(tx => {
         return tx.get(ref).then(doc => {
-          const current = (doc.exists && Array.isArray(doc.data().dates)) ? doc.data().dates : [];
-          const conflict = dates.find(d => current.indexOf(d) !== -1);
+          const currentBookings = (doc.exists && doc.data().bookings) ? doc.data().bookings : {};
+          // Check for conflicts
+          const conflict = dates.find(d => currentBookings.hasOwnProperty(d));
           if (conflict) throw new Error('conflict:' + conflict);
-          const merged = Array.from(new Set((current || []).concat(dates))).sort();
-          tx.set(ref, { dates: merged }, { merge: true });
-          return merged;
+          // Add new dates with userId and timestamp
+          const updated = { ...currentBookings };
+          dates.forEach(d => {
+            updated[d] = { userId, timestamp: new Date().toISOString() };
+          });
+          tx.set(ref, { bookings: updated }, { merge: true });
+          return Object.keys(updated).sort();
         });
-      }).then(merged => ({ok:true, dates: merged})).catch(err => ({ok:false, err: err && err.message ? err.message : String(err)}));
+      }).then(dateList => ({ok:true, dates: dateList})).catch(err => ({ok:false, err: err && err.message ? err.message : String(err)}));
     }
 
-    // Remove specific dates from a category document in Firestore
+    // Remove specific dates from a category document in Firestore (only if current user booked them)
     function removeDatesFromFirestore(category, datesToRemove){
       if (!window._useFirestore || !window._firestore) return Promise.reject(new Error('Firestore not configured'));
+      const userId = ensureUserId();
       const ref = window._firestore.collection('bookings').doc(category);
       return window._firestore.runTransaction(tx => {
         return tx.get(ref).then(doc => {
-          const current = (doc.exists && Array.isArray(doc.data().dates)) ? doc.data().dates : [];
-          const remaining = current.filter(d => datesToRemove.indexOf(d) === -1);
-          tx.set(ref, { dates: remaining }, { merge: true });
-          return remaining;
+          const currentBookings = (doc.exists && doc.data().bookings) ? doc.data().bookings : {};
+          // Check ownership: only allow removal if current user booked the date
+          const unowned = datesToRemove.find(d => currentBookings[d] && currentBookings[d].userId !== userId);
+          if (unowned) throw new Error('not-owner:' + unowned);
+          // Remove the dates
+          const updated = { ...currentBookings };
+          datesToRemove.forEach(d => delete updated[d]);
+          tx.set(ref, { bookings: updated }, { merge: true });
+          return Object.keys(updated).sort();
         });
-      }).then(remaining => ({ok:true, dates: remaining})).catch(err => ({ok:false, err: err && err.message ? err.message : String(err)}));
+      }).then(dateList => ({ok:true, dates: dateList})).catch(err => ({ok:false, err: err && err.message ? err.message : String(err)}));
     }
 
-    // Move (remove originals and add newDates) in a single Firestore transaction
+    // Move (remove originals and add newDates) in a single Firestore transaction (only if current user owns originals)
     function moveDatesInFirestore(category, originals, newDates){
       if (!window._useFirestore || !window._firestore) return Promise.reject(new Error('Firestore not configured'));
+      const userId = ensureUserId();
       const ref = window._firestore.collection('bookings').doc(category);
       return window._firestore.runTransaction(tx => {
         return tx.get(ref).then(doc => {
-          const current = (doc.exists && Array.isArray(doc.data().dates)) ? doc.data().dates : [];
-          const existing = new Set(current);
-          // remove originals temporarily for conflict check
-          (originals||[]).forEach(d=> existing.delete(d));
-          const conflict = (newDates||[]).find(d => existing.has(d));
+          const currentBookings = (doc.exists && doc.data().bookings) ? doc.data().bookings : {};
+          // Check ownership: only allow move if current user booked the originals
+          const unowned = (originals||[]).find(d => currentBookings[d] && currentBookings[d].userId !== userId);
+          if (unowned) throw new Error('not-owner:' + unowned);
+          // Check conflicts for new dates (excluding the originals being moved)
+          const conflict = (newDates||[]).find(d => currentBookings[d] && originals.indexOf(d) === -1);
           if (conflict) throw new Error('conflict:' + conflict);
-          const merged = Array.from(new Set(Array.from(existing).concat(newDates))).sort();
-          tx.set(ref, { dates: merged }, { merge: true });
-          return merged;
+          // Apply move: remove originals, add newDates
+          const updated = { ...currentBookings };
+          (originals||[]).forEach(d => delete updated[d]);
+          newDates.forEach(d => {
+            updated[d] = { userId, timestamp: new Date().toISOString() };
+          });
+          tx.set(ref, { bookings: updated }, { merge: true });
+          return Object.keys(updated).sort();
         });
-      }).then(merged => ({ok:true, dates: merged})).catch(err => ({ok:false, err: err && err.message ? err.message : String(err)}));
+      }).then(dateList => ({ok:true, dates: dateList})).catch(err => ({ok:false, err: err && err.message ? err.message : String(err)}));
     }
 
 
@@ -3141,6 +3188,9 @@
                 window._firestoreReady.then(()=> moveDatesInFirestore(cat, _moveState.original || [], newDates)).then(res=>{
                   if (!res || !res.ok){
                     const msg = res && res.err ? res.err : 'Unknown error';
+                    if (typeof msg === 'string' && msg.indexOf('not-owner:')===0) {
+                      return alert('You can only move dates you booked. This date was booked by another user.');
+                    }
                     if (typeof msg === 'string' && msg.indexOf('conflict:')===0){
                       const conflict = msg.split(':')[1] || msg;
                       return alert('Cannot move: target dates conflict with existing booking: '+conflict);
@@ -3527,7 +3577,13 @@
       // If Firestore configured, remove there first
       if (window._useFirestore && window._firestoreReady) {
         window._firestoreReady.then(()=> removeDatesFromFirestore(cat, [dateStr])).then(res=>{
-          if (!res || !res.ok){ alert('Unable to remove booking: '+(res && res.err?res.err:'unknown error')); return; }
+          if (!res || !res.ok){
+            const msg = res && res.err ? res.err : 'unknown error';
+            if (typeof msg === 'string' && msg.indexOf('not-owner:')===0) {
+              return alert('You can only delete dates you booked. This date was booked by another user.');
+            }
+            return alert('Unable to remove booking: '+msg);
+          }
           try { const bookings = _loadBookings(); bookings[cat] = res.dates || []; _saveBookings(bookings); }catch(e){}
           alert('Deleted booking '+dateStr);
           renderBookingCalendar();
@@ -4711,7 +4767,6 @@
       }
     });
   </script>
-
 
 
 
