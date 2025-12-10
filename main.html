@@ -404,7 +404,7 @@
 
     /* Booking modal */
     .booking-modal { display:none; position:fixed; inset:0; background:rgba(0,0,0,0.6); z-index:11000; justify-content:center; align-items:center; padding:1rem; }
-    .booking-box { background:#fff; width:100%; max-width:560px; max-height:100vh; border-radius:12px; padding:1rem; box-shadow:0 10px 30px rgba(0,0,0,0.2); display:flex; flex-direction:column; gap:0.75rem; }
+    .booking-box { background:#fff; width:100%; max-width:560px; max-height:85vh; border-radius:12px; padding:1rem; box-shadow:0 10px 30px rgba(0,0,0,0.2); display:flex; flex-direction:column; gap:0.75rem; }
     .booking-header { display:flex; justify-content:space-between; align-items:center; }
     .booking-calendar { display:grid; grid-template-columns: repeat(7,1fr); gap:6px; }
     .cal-day { position:relative; }
@@ -2952,6 +2952,39 @@
       }).then(merged => ({ok:true, dates: merged})).catch(err => ({ok:false, err: err && err.message ? err.message : String(err)}));
     }
 
+    // Remove specific dates from a category document in Firestore
+    function removeDatesFromFirestore(category, datesToRemove){
+      if (!window._useFirestore || !window._firestore) return Promise.reject(new Error('Firestore not configured'));
+      const ref = window._firestore.collection('bookings').doc(category);
+      return window._firestore.runTransaction(tx => {
+        return tx.get(ref).then(doc => {
+          const current = (doc.exists && Array.isArray(doc.data().dates)) ? doc.data().dates : [];
+          const remaining = current.filter(d => datesToRemove.indexOf(d) === -1);
+          tx.set(ref, { dates: remaining }, { merge: true });
+          return remaining;
+        });
+      }).then(remaining => ({ok:true, dates: remaining})).catch(err => ({ok:false, err: err && err.message ? err.message : String(err)}));
+    }
+
+    // Move (remove originals and add newDates) in a single Firestore transaction
+    function moveDatesInFirestore(category, originals, newDates){
+      if (!window._useFirestore || !window._firestore) return Promise.reject(new Error('Firestore not configured'));
+      const ref = window._firestore.collection('bookings').doc(category);
+      return window._firestore.runTransaction(tx => {
+        return tx.get(ref).then(doc => {
+          const current = (doc.exists && Array.isArray(doc.data().dates)) ? doc.data().dates : [];
+          const existing = new Set(current);
+          // remove originals temporarily for conflict check
+          (originals||[]).forEach(d=> existing.delete(d));
+          const conflict = (newDates||[]).find(d => existing.has(d));
+          if (conflict) throw new Error('conflict:' + conflict);
+          const merged = Array.from(new Set(Array.from(existing).concat(newDates))).sort();
+          tx.set(ref, { dates: merged }, { merge: true });
+          return merged;
+        });
+      }).then(merged => ({ok:true, dates: merged})).catch(err => ({ok:false, err: err && err.message ? err.message : String(err)}));
+    }
+
 
     let _bookingState = { category: null, year: null, month: null, selected: null };
 
@@ -3102,14 +3135,31 @@
                 const key = `${dt.getFullYear()}-${String(dt.getMonth()+1).padStart(2,'0')}-${String(dt.getDate()).padStart(2,'0')}`;
                 newDates.push(key);
               }
-              const bookings = _loadBookings();
               const cat = _moveState.category;
+              // If Firestore is configured, perform the move in Firestore
+              if (window._useFirestore && window._firestoreReady) {
+                window._firestoreReady.then(()=> moveDatesInFirestore(cat, _moveState.original || [], newDates)).then(res=>{
+                  if (!res || !res.ok){
+                    const msg = res && res.err ? res.err : 'Unknown error';
+                    if (typeof msg === 'string' && msg.indexOf('conflict:')===0){
+                      const conflict = msg.split(':')[1] || msg;
+                      return alert('Cannot move: target dates conflict with existing booking: '+conflict);
+                    }
+                    return alert('Error moving booking: ' + msg);
+                  }
+                  try { const bookings = _loadBookings(); bookings[cat] = res.dates || []; _saveBookings(bookings); } catch(e){}
+                  _moveState = null;
+                  alert('Booking moved to: ' + newDates.join(', '));
+                  renderBookingCalendar();
+                }).catch(err=>{ console.error('Firestore move error', err); alert('Unable to move booking via Firestore.'); });
+                return;
+              }
+              // Fallback: localStorage move
+              const bookings = _loadBookings();
               const existing = new Set(bookings[cat] || []);
-              // remove originals from conflict check
               (_moveState.original || []).forEach(d=> existing.delete(d));
               const conflict = newDates.find(d=> existing.has(d));
               if (conflict) return alert('Cannot move: target dates conflict with existing booking: '+conflict);
-              // apply move: remove originals, add newDates
               bookings[cat] = (bookings[cat] || []).filter(d=> !((_moveState.original||[]).includes(d))).concat(newDates);
               bookings[cat] = Array.from(new Set(bookings[cat])).sort();
               _saveBookings(bookings);
@@ -3473,8 +3523,19 @@
     /* Manage UI removed per user request. Booking list now shows booked dates in the calendar view. */
 
     function deleteBookedDate(dateStr){
-      const bookings = _loadBookings();
       const cat = _bookingState.category;
+      // If Firestore configured, remove there first
+      if (window._useFirestore && window._firestoreReady) {
+        window._firestoreReady.then(()=> removeDatesFromFirestore(cat, [dateStr])).then(res=>{
+          if (!res || !res.ok){ alert('Unable to remove booking: '+(res && res.err?res.err:'unknown error')); return; }
+          try { const bookings = _loadBookings(); bookings[cat] = res.dates || []; _saveBookings(bookings); }catch(e){}
+          alert('Deleted booking '+dateStr);
+          renderBookingCalendar();
+        }).catch(err=>{ console.error('Firestore delete error', err); alert('Error deleting booking.'); });
+        return;
+      }
+      // Fallback: localStorage
+      const bookings = _loadBookings();
       bookings[cat] = (bookings[cat] || []).filter(d=>d!==dateStr);
       _saveBookings(bookings);
       alert('Deleted booking '+dateStr);
@@ -4650,7 +4711,6 @@
       }
     });
   </script>
-
 
 
 
