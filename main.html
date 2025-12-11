@@ -2989,30 +2989,46 @@
     // Remove specific dates from a category document in Firestore (only if current user booked them)
     function removeDatesFromFirestore(category, datesToRemove){
       console.log('removeDatesFromFirestore called', { category, datesToRemove, useFirestore: window._useFirestore });
+       console.log('Firestore availability check - hasFirestore:', !!window._firestore, 'useFirestore:', window._useFirestore);
       if (!window._useFirestore || !window._firestore) return Promise.reject(new Error('Firestore not configured'));
       const userId = ensureUserId();
+       console.log('ensureUserId returned:', userId);
       const ref = window._firestore.collection('bookings').doc(category);
-      console.log('Starting Firestore transaction, userId:', userId);
+       console.log('Firestore transaction starting for ref:', ref.path, 'userId:', userId);
       return window._firestore.runTransaction(tx => {
+         console.log('Inside runTransaction callback');
         return tx.get(ref).then(doc => {
-          console.log('Got Firestore doc:', { exists: doc.exists, data: doc.data() });
+           console.log('tx.get succeeded - doc.exists:', doc.exists);
+           if (doc.exists) {
+             console.log('Document exists, data:', doc.data());
+           } else {
+             console.log('Document does not exist');
+           }
           const currentBookings = (doc.exists && doc.data().bookings) ? doc.data().bookings : {};
           console.log('Current bookings:', currentBookings);
+           console.log('Checking ownership for', datesToRemove.length, 'dates');
           // Check ownership: only allow removal if current user booked the date
           const unowned = datesToRemove.find(d => currentBookings[d] && currentBookings[d].userId !== userId);
+           if (unowned) {
+             console.log('Ownership check FAILED for date:', unowned, 'Expected userId:', userId, 'Actual userId:', currentBookings[unowned]?.userId);
+           } else {
+             console.log('Ownership check PASSED for all dates');
+           }
           if (unowned) throw new Error('not-owner:' + unowned);
           // Remove the dates
           const updated = { ...currentBookings };
           datesToRemove.forEach(d => delete updated[d]);
           console.log('Updated bookings after removal:', updated);
+           console.log('About to call tx.set with merged data');
           tx.set(ref, { bookings: updated }, { merge: true });
+           console.log('tx.set called successfully');
           return Object.keys(updated).sort();
         });
       }).then(dateList => {
         console.log('Transaction succeeded, remaining dates:', dateList);
         return {ok:true, dates: dateList};
       }).catch(err => {
-        console.error('Transaction error:', err);
+         console.error('Transaction error:', err.message || err, 'Full error:', err);
         return {ok:false, err: err && err.message ? err.message : String(err)};
       });
     }
@@ -3157,7 +3173,7 @@
           optDel.style.background = 'transparent';
           optDel.style.border = 'none';
           optDel.style.cursor = 'pointer';
-          optDel.onclick = (ev)=>{ ev.stopPropagation(); if (confirm('Delete booking '+dayStr+'?')){ deleteBookedDate(dayStr); } menu.style.display='none'; mb.setAttribute('aria-expanded','false'); };
+          optDel.onclick = (ev)=>{ ev.stopPropagation(); if (confirm('Delete booking '+dayStr+'?')){ deleteBookedDate(dayStr, _bookingState.category); } menu.style.display='none'; mb.setAttribute('aria-expanded','false'); };
 
           const optMove = document.createElement('button');
           optMove.type = 'button';
@@ -3584,39 +3600,63 @@
 
     /* Manage UI removed per user request. Booking list now shows booked dates in the calendar view. */
 
-    function deleteBookedDate(dateStr){
-      const cat = _bookingState.category;
-      console.log('Attempting to delete date:', dateStr, 'from category:', cat);
-      // If Firestore configured, remove there first
-      if (window._useFirestore && window._firestoreReady) {
-        window._firestoreReady.then(()=> {
-          console.log('Firestore ready, calling removeDatesFromFirestore');
-          return removeDatesFromFirestore(cat, [dateStr]);
-        }).then(res=>{
-          console.log('removeDatesFromFirestore response:', res);
-          if (!res || !res.ok){
-            const msg = res && res.err ? res.err : 'unknown error';
-            if (typeof msg === 'string' && msg.indexOf('not-owner:')===0) {
-              return alert('You can only delete dates you booked. This date was booked by another user.');
-            }
-            return alert('Unable to remove booking: '+msg);
-          }
-          // Success: the realtime listener will automatically update localStorage and calendar
-          // Just show the success message; the listener will refresh the UI
-          alert('Deleted booking '+dateStr);
-          // Small delay to let the listener catch up, then force refresh to be sure
-          setTimeout(()=>{ try { renderBookingCalendar(); } catch(e){}  }, 100);
-        }).catch(err=>{ console.error('Firestore delete error', err); alert('Error deleting booking: ' + err.message); });
+   function deleteBookedDate(dateStr, category){
+  const cat = category || _bookingState.category;
+  console.log('Attempting to delete date:', dateStr, 'from category:', cat, 'passedCategory:', category);
+
+  // Optimistic local removal so UI is responsive even if Firestore is slow/unavailable
+  try {
+    const bookings = _loadBookings();
+    const before = (bookings[cat] || []).slice();
+    bookings[cat] = before.filter(d => d !== dateStr);
+    _saveBookings(bookings);
+    renderBookingCalendar();
+  } catch (e) {
+    console.error('Local removal failed', e);
+  }
+
+  // If Firestore configured, attempt server-side removal and revert on ownership error
+  if (window._useFirestore && window._firestoreReady) {
+    window._firestoreReady.then(()=> {
+      console.log('Firestore ready, calling removeDatesFromFirestore', {cat, dateStr});
+      return removeDatesFromFirestore(cat, [dateStr]);
+    }).then(res=>{
+      console.log('removeDatesFromFirestore response:', res);
+      if (!res || !res.ok){
+        const msg = res && res.err ? res.err : 'unknown error';
+        // if not-owner, revert local deletion and notify user
+        if (typeof msg === 'string' && msg.indexOf('not-owner:')===0) {
+          try {
+            const bookings = _loadBookings();
+            bookings[cat] = bookings[cat] || [];
+            // re-add the date if it's missing
+            if (bookings[cat].indexOf(dateStr) === -1) bookings[cat].push(dateStr);
+            // keep sorted
+            bookings[cat] = bookings[cat].sort();
+            _saveBookings(bookings);
+            renderBookingCalendar();
+          } catch (e) { console.error('Failed to revert local deletion', e); }
+          return alert('You can only delete dates you booked. This date was booked by another user.');
+        }
+        // Other errors: notify and allow user to retry; keep optimistic removal
+        alert('Unable to remove booking from server: '+msg);
         return;
       }
-      // Fallback: localStorage
-      console.log('Firestore not available, using localStorage fallback');
-      const bookings = _loadBookings();
-      bookings[cat] = (bookings[cat] || []).filter(d=>d!==dateStr);
-      _saveBookings(bookings);
-      alert('Deleted booking '+dateStr);
-      renderBookingCalendar();
-    }
+      // Success: server agrees. Ensure local state matches server state.
+      try{
+        const bookings = _loadBookings();
+        bookings[cat] = (res.dates || []).slice();
+        _saveBookings(bookings);
+        renderBookingCalendar();
+      }catch(e){ console.warn('Failed to sync local bookings after server delete', e); }
+    }).catch(err=>{ console.error('Firestore delete error', err); alert('Error deleting booking: ' + (err && err.message ? err.message : String(err))); });
+    return;
+  }
+
+  // No Firestore: optimistic local removal already applied
+  alert('Deleted booking '+dateStr);
+  try { closeBooking(); } catch(e){}
+}
 
     function startMoveBooking(dateStr){
       // prepare move state: single-day move
